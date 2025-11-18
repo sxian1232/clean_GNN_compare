@@ -1,166 +1,160 @@
+# train_local.py
 import argparse
 import json
 import os
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
+from pathlib import Path
 
-from model import Model
-from xin_feeder_baidu import Feeder   # 你现有的数据 Feeder
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
+import torch.optim as optim
 
-##############################################################
-#                  CONFIG (可自行修改)
-##############################################################
+from traj_dataset import TrajDataset
+from model import Model
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-history_frames = 6
-future_frames = 6
-batch_size = 32
-epochs = 1
-lr = 0.001
-prox_mu_default = 0.0        # =0 就是 FedAvg ，>0 就是 FedProx
 
-##############################################################
-#            数据预处理（保持与 eval_only 一致）
-##############################################################
+# -------------------------
+#   Utils
+# -------------------------
+def ensure_dir(path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-def preprocess_batch(ori_data):
+
+def eval_ws(model, loader, device):
     """
-    ori_data: (N, 11, T, V)
-    输出:
-      data: (N, 4, T, V)    # dx, dy, heading, mask
-      ori_xy: (N, 2, T, V)  # x,y 原始坐标
-      mask: (N, 1, T, V)
+    返回：
+        ws_per_horizon: list[6]
+        ws_sum: float
     """
-    # 取 [x, y, heading, mask]  = index [3,4,9,10]
-    feat_id = [3, 4, 9, 10]
-    ori = ori_data[:, feat_id].float().to(device)      # (N,4,T,V)
+    model.eval()
+    total_sum = np.zeros(6, dtype=np.float64)
+    total_count = np.zeros(6, dtype=np.float64)
 
-    xy = ori_data[:, 3:5].float().to(device)           # (N,2,T,V)
-    mask = ori_data[:, 10:11].float().to(device)       # (N,1,T,V)
+    with torch.no_grad():
+        for feat, A, mean_xy in loader:
+            feat = feat.to(device)
+            A = A.to(device)
 
-    # 差分位移
-    data = ori.clone()
-    new_mask = (data[:, :2, 1:] != 0) * (data[:, :2, :-1] != 0)
-    data[:, :2, 1:] = (data[:, :2, 1:] - data[:, :2, :-1]) * new_mask
-    data[:, :2, 0] = 0
+            input_data = feat[:, :, :6, :]
+            output_gt = feat[:, :2, 6:, :]
+            output_mask = feat[:, 10:, 6:, :]
 
-    return data, xy, mask
+            pred = model(
+                pra_x=input_data,
+                pra_A=A,
+                pra_pred_length=6,
+                pra_teacher_forcing_ratio=0,
+                pra_teacher_location=None
+            )
 
+            diff = (pred - output_gt).abs() * output_mask
+            sum_t = diff.sum(dim=1).sum(dim=-1).cpu().numpy()
+            cnt_t = output_mask.sum(dim=1).sum(dim=-1).cpu().numpy()
 
-##############################################################
-#                    Smooth L1 损失（WS 风格）
-##############################################################
+            total_sum += sum_t.sum(axis=0)
+            total_count += cnt_t.sum(axis=0)
 
-def compute_ws_loss(pred, gt, mask):
-    """
-    pred, gt: (N,2,T,V)
-    mask: (N,1,T,V)
-
-    输出：一个标量 loss，用于 backward
-    """
-    diff = torch.abs(pred - gt) * mask
-    num = torch.sum(mask)
-    loss = torch.sum(diff) / (num + 1e-9)
-    return loss
+    ws = total_sum / (total_count + 1e-9)
+    return list(ws), float(ws.sum())
 
 
-##############################################################
-#                       训练入口
-##############################################################
+# -------------------------
+#   Training
+# -------------------------
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
 
-def train_one_local_model(train_data_path, init_model_path,
-                          out_model_path, prox_mu=0.0):
-    """
-    prox_mu = 0   → FedAvg
-    prox_mu > 0   → FedProx
-    """
+    for i, (feat, A, _) in enumerate(loader):
+        feat = feat.to(device)
+        A = A.to(device)
 
-    # --------------------- Load Data ---------------------
-    feeder = Feeder(
-        data_path=train_data_path,
-        graph_args={'max_hop': 2, 'num_node': 120},
-        train_val_test='all'
-    )
-    loader = DataLoader(feeder, batch_size=batch_size,
-                        shuffle=True, drop_last=False, num_workers=2)
+        input_data = feat[:, :, :6, :]
+        output_gt = feat[:, :2, 6:, :]
+        output_mask = feat[:, 10:, 6:, :]
 
-    # --------------------- Load Model ---------------------
+        pred = model(
+            pra_x=input_data,
+            pra_A=A,
+            pra_pred_length=6,
+            pra_teacher_forcing_ratio=0,
+            pra_teacher_location=output_gt
+        )
+
+        diff = (pred - output_gt).abs() * output_mask
+        loss = diff.sum() / (output_mask.sum() + 1e-9)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if i % 10 == 0:
+            print(f"Iter {i:04d} | loss {loss.item():.6f}")
+
+
+# -------------------------
+#   Main
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--init_model", type=str, default="none")
+    parser.add_argument("--out_model", type=str, required=True)
+    parser.add_argument("--metrics_out", type=str, required=True)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=1)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    # Dataset
+    ds_train = TrajDataset(args.train_data)
+    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+
+    # Model
     model = Model(
-        in_channels=4,
-        graph_args={'max_hop': 2, 'num_node': 120},
+        in_channels=11,         # ← 正确：feature 有 11 个通道
+        graph_args={"max_hop": 2, "num_node": 120},
         edge_importance_weighting=True
     ).to(device)
 
-    # 加载初始化模型
-    ckpt = torch.load(init_model_path, map_location=device)
-    state = ckpt["xin_graph_seq2seq_model"]
-    model.load_state_dict(state)
+    # -------- FIXED LOGIC HERE --------
+    if args.init_model.lower() != "none":
+        print(f"Loading init model: {args.init_model}")
+        ckpt = torch.load(args.init_model, map_location="cpu")
+        model.load_state_dict(ckpt['xin_graph_seq2seq_model'])
+    else:
+        print("No init model provided. Training from scratch.")
+    # ----------------------------------
 
-    # FedProx 用
-    global_params = {k: v.clone().detach() for k, v in model.state_dict().items()}
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    for ep in range(args.epochs):
+        print(f"\n===== Epoch {ep+1}/{args.epochs} =====")
+        train_one_epoch(model, dl_train, optimizer, device)
 
-    # --------------------- Training Loop ---------------------
-    for ep in range(epochs):
-        model.train()
-        for ori_data, A, _ in loader:
-            A = A.float().to(device)
-            data, ori_xy, mask = preprocess_batch(ori_data)
+    # Save model
+    ensure_dir(args.out_model)
+    torch.save({"xin_graph_seq2seq_model": model.state_dict()}, args.out_model)
+    print("Saved model →", args.out_model)
 
-            inp = data[:, :, :history_frames, :]       # (N,4,6,V)
-            gt = ori_xy[:, :, history_frames:, :]      # (N,2,6,V)
-            m  = mask[:, :, history_frames:, :]        # (N,1,6,V)
+    # Compute WS
+    ws_per_h, ws_sum = eval_ws(model, dl_train, device)
 
-            optimizer.zero_grad()
-            pred = model(
-                pra_x=inp,
-                pra_A=A,
-                pra_pred_length=future_frames,
-                pra_teacher_forcing_ratio=0,
-                pra_teacher_location=None
-            )  # (N,2,6,V)
+    metrics = {
+        "train_data": args.train_data,
+        "init_model": args.init_model,
+        "epochs": args.epochs,
+        "ws_per_horizon": ws_per_h,
+        "ws_sum": ws_sum
+    }
 
-            # WS loss
-            loss = compute_ws_loss(pred, gt, m)
+    ensure_dir(args.metrics_out)
+    with open(args.metrics_out, "w") as f:
+        json.dump(metrics, f, indent=2)
 
-            # FedProx μ/2 · ||w - w_global||²
-            if prox_mu > 0:
-                prox_term = 0.0
-                for name, p in model.named_parameters():
-                    prox_term += torch.sum((p - global_params[name]) ** 2)
-                loss += prox_mu / 2 * prox_term
+    print("Saved metrics →", args.metrics_out)
 
-            loss.backward()
-            optimizer.step()
-
-    # --------------------- Save ---------------------
-    out = {"xin_graph_seq2seq_model": model.state_dict()}
-    os.makedirs(os.path.dirname(out_model_path), exist_ok=True)
-    torch.save(out, out_model_path)
-
-    print(f"[OK] Saved local model → {out_model_path}")
-    return out_model_path
-
-
-##############################################################
-#                   CLI / 命令行接口
-##############################################################
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_data", required=True)
-    ap.add_argument("--init_model", required=True)
-    ap.add_argument("--out_model", required=True)
-    ap.add_argument("--prox_mu", type=float, default=prox_mu_default)
-    args = ap.parse_args()
-
-    train_one_local_model(
-        train_data_path=args.train_data,
-        init_model_path=args.init_model,
-        out_model_path=args.out_model,
-        prox_mu=args.prox_mu
-    )
-
+    main()
