@@ -1,21 +1,4 @@
 # data_process_clean.py
-#
-# 目标：
-#   从 data/raw/scene_A, data/raw/scene_B 读取原始 txt，
-#   按时间拼成连续帧，再用滑动窗口 (T=12) 生成轨迹 sample：
-#       feature: (N, 11, 12, 120)
-#       adjacency: (N, 120, 120)    # 目前用 I_120，占位
-#       mean_xy: (N, 2)             # 目前简单用 0 或平均值
-#
-#   然后按 8:1:1 切成 train / val / test
-#   保存到 data/processed/{train,val,test}.pkl ，格式：
-#       pickle.dump([features, adj, mean_xy], f)
-#
-# 说明：
-#   - 这里不再区分原作者那种 train_data_all / test_data 乱七八糟，
-#     而是用一个干净、标准的 train/val/test 划分。
-#   - adjacency 和 mean_xy 用的是“安全简化版”，足够支撑后面的
-#     FedAvg / FedProx / MMD / MAE 实验，不再依赖作者的屎山逻辑。
 
 import os
 import glob
@@ -40,9 +23,8 @@ SCENE_A_DIR    = os.path.join(RAW_ROOT, "scene_A")
 SCENE_B_TXT    = os.path.join(RAW_ROOT, "scene_B", "scene_B.txt")
 
 OUT_DIR        = "data/processed"
-TRAIN_OUT_PKL  = os.path.join(OUT_DIR, "train.pkl")
-VAL_OUT_PKL    = os.path.join(OUT_DIR, "val.pkl")
 TEST_OUT_PKL   = os.path.join(OUT_DIR, "test.pkl")
+USERS_OUT_DIR  = os.path.join(OUT_DIR, "users_clean")  # 新增：按 user 切分后的数据放这里
 
 
 # -----------------------------
@@ -58,10 +40,6 @@ def parse_scene_A() -> list[dict]:
     返回：
         frames: list[dict]，长度 = 全局帧数
         frames[t] 是一个 dict: {object_id: (obj_type, x,y,z,len,w,h,heading)}
-    逻辑：
-        - 先按文件名排序（时间顺序）
-        - 每个文件有 2 帧：local_frame_id ∈ {0,1}
-        - 我们把它展开成全局时间轴：file0(0),file0(1),file1(0),file1(1),...
     """
     frames = []
 
@@ -72,7 +50,6 @@ def parse_scene_A() -> list[dict]:
 
     print(f"Parsing {SCENE_A_DIR}: {len(txt_files)} files")
 
-    # global_frame_idx = 0   # 其实不需要存下来，用 frames 下标就是全局 frame id
     for fname in tqdm(txt_files, desc="scene_A", unit="file"):
         frame_dict: dict[int, dict[int, tuple]] = defaultdict(dict)
         # frame_dict[local_frame_id][object_id] = (obj_type, x,y,z,len,w,h,heading)
@@ -84,7 +61,6 @@ def parse_scene_A() -> list[dict]:
                     continue
                 parts = line.split()
                 if len(parts) < 10:
-                    # 期望: frame_id, obj_id, obj_type, x,y,z,len,w,h,heading  -> 10 列
                     continue
                 lf   = int(parts[0])
                 oid  = int(parts[1])
@@ -99,7 +75,6 @@ def parse_scene_A() -> list[dict]:
 
                 frame_dict[lf][oid] = (otyp, x, y, z, L, W, H, head)
 
-        # 按 local frame 顺序(0,1,...)展开
         for lf in sorted(frame_dict.keys()):
             frames.append(frame_dict[lf])
 
@@ -111,7 +86,6 @@ def parse_scene_B() -> list[dict]:
     """
     解析 data/raw/scene_B/scene_B.txt
     返回与 parse_scene_A 相同格式的 frames 列表。
-    scene_B.txt 自身已经包含多个 frame_id，我们按 frame_id 分组即可。
     """
     frames = []
 
@@ -144,7 +118,6 @@ def parse_scene_B() -> list[dict]:
 
             frame_dict[fid][oid] = (otyp, x, y, z, L, W, H, head)
 
-    # 按 fid 排序
     for fid in sorted(frame_dict.keys()):
         frames.append(frame_dict[fid])
 
@@ -192,14 +165,13 @@ def build_samples_from_frames(frames: list[dict]) -> tuple[np.ndarray, np.ndarra
         # 2) 初始化 feature 与 mask
         feat = np.zeros((C_FEAT, T_TOTAL, V_MAX), dtype=np.float32)
 
-        # frame_id 我们就用 local 时间 [0..T-1]，也可以换成全局 start+τ
         for t, fr in enumerate(win_frames):
             for oid, (otyp, x, y, z, L, W, H, head) in fr.items():
                 if oid not in id_to_idx:
                     continue
                 j = id_to_idx[oid]
 
-                feat[0, t, j] = float(t)     # frame_id
+                feat[0, t, j] = float(t)     # frame_id (local)
                 feat[1, t, j] = float(oid)   # object_id
                 feat[2, t, j] = float(otyp)  # object_type
                 feat[3, t, j] = x
@@ -214,7 +186,7 @@ def build_samples_from_frames(frames: list[dict]) -> tuple[np.ndarray, np.ndarra
         # 3) adjacency：先用单位矩阵占位（只保留自连边）
         adj = np.eye(V_MAX, dtype=np.float32)
 
-        # 4) mean_xy：简单用窗口内所有有效点的平均 (也可以设成 0)
+        # 4) mean_xy：窗口内所有有效点的平均
         mask = feat[10]  # (T,V_MAX)
         x_vals = feat[3] * mask
         y_vals = feat[4] * mask
@@ -247,7 +219,9 @@ def build_samples_from_frames(frames: list[dict]) -> tuple[np.ndarray, np.ndarra
 
 
 def main():
+    # 创建输出目录
     ensure_dir(OUT_DIR)
+    ensure_dir(USERS_OUT_DIR)
 
     # 1) 解析两个 scene
     frames_A = parse_scene_A()
@@ -268,45 +242,58 @@ def main():
         print("[WARN] No samples built, please check raw data / parser assumptions.")
         return
 
-    # 3) 打乱并划分 train / val / test
+    # -----------------------------
+    # 3) 先切 global test，再把剩余样本均分成 5 份作为 5 个用户
+    # -----------------------------
     rng = np.random.RandomState(0)
     idx = np.arange(N)
     rng.shuffle(idx)
 
-    n_train = int(0.8 * N)
-    n_val   = int(0.1 * N)
-    n_test  = N - n_train - n_val
+    # 先拿出 test（例如 10%）
+    test_ratio = 0.1
+    n_test = int(test_ratio * N)
+    idx_test = idx[:n_test]
+    idx_rest = idx[n_test:]
 
-    idx_train = idx[:n_train]
-    idx_val   = idx[n_train:n_train + n_val]
-    idx_test  = idx[n_train + n_val:]
+    print(f"n_test = {n_test}, n_rest = {len(idx_rest)}")
 
-    def subset(arr, indices):
-        return arr[indices]
+    # 保存 test（干净的 global test）
+    test_feat = features[idx_test]
+    test_adj  = adjacency[idx_test]
+    test_mean = mean_xy[idx_test]
 
-    train_feat = subset(features, idx_train)
-    train_adj  = subset(adjacency, idx_train)
-    train_mean = subset(mean_xy, idx_train)
-
-    val_feat = subset(features, idx_val)
-    val_adj  = subset(adjacency, idx_val)
-    val_mean = subset(mean_xy, idx_val)
-
-    test_feat = subset(features, idx_test)
-    test_adj  = subset(adjacency, idx_test)
-    test_mean = subset(mean_xy, idx_test)
-
-    # 4) 保存到 pkl
-    with open(TRAIN_OUT_PKL, "wb") as f:
-        pickle.dump([train_feat, train_adj, train_mean], f, protocol=pickle.HIGHEST_PROTOCOL)
-    with open(VAL_OUT_PKL, "wb") as f:
-        pickle.dump([val_feat, val_adj, val_mean], f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(TEST_OUT_PKL, "wb") as f:
         pickle.dump([test_feat, test_adj, test_mean], f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    print(f"\n[Saved] {TRAIN_OUT_PKL}  ({train_feat.shape[0]} samples)")
-    print(f"[Saved] {VAL_OUT_PKL}    ({val_feat.shape[0]} samples)")
     print(f"[Saved] {TEST_OUT_PKL}   ({test_feat.shape[0]} samples)")
+
+    # 把剩余样本均分给 5 个 user
+    num_users = 5
+    n_rest = len(idx_rest)
+    # 均匀分配，前 remainder 个多一个样本
+    base = n_rest // num_users
+    rem  = n_rest % num_users
+
+    user_indices_list = []
+    start = 0
+    for u in range(num_users):
+        size = base + (1 if u < rem else 0)
+        end = start + size
+        user_indices_list.append(idx_rest[start:end])
+        start = end
+
+    # 检查一下
+    assert start == n_rest, "Split error: not all samples assigned to users."
+
+    # 依次保存 user1..user5 的“干净全集”
+    for u, u_idx in enumerate(user_indices_list, start=1):
+        u_feat = features[u_idx]
+        u_adj  = adjacency[u_idx]
+        u_mean = mean_xy[u_idx]
+
+        out_path = os.path.join(USERS_OUT_DIR, f"user{u}_clean_all.pkl")
+        with open(out_path, "wb") as f:
+            pickle.dump([u_feat, u_adj, u_mean], f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[Saved] {out_path}  ({u_feat.shape[0]} samples)")
 
 
 if __name__ == "__main__":
