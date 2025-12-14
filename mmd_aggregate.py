@@ -190,6 +190,48 @@ def compute_mmd_rbf(x, y, gamma=0.01, block=65536):
     return float(exx + eyy - 2.0 * exy)
 
 
+def auto_gamma_from_vectors(ref_vec, user_vecs, max_samples=2000, seed=0):
+    """
+    Simple median-heuristic gamma selection.
+
+    We concatenate ref_vec and all user_vecs into one long 1D array,
+    randomly subsample up to `max_samples` entries, compute pairwise
+    squared distances, and set:
+
+        gamma = 1 / median(dist^2)
+
+    This makes gamma scale-invariant and data-dependent.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Concatenate all vectors
+    all_vec = np.concatenate([ref_vec] + list(user_vecs), axis=0)
+    all_vec = all_vec.reshape(-1)
+
+    n = all_vec.shape[0]
+    if n <= 1:
+        return 1.0
+
+    # Subsample if too long, to keep O(n^2) manageable
+    if n > max_samples:
+        idx = rng.choice(n, size=max_samples, replace=False)
+        sub = all_vec[idx].reshape(-1, 1)
+    else:
+        sub = all_vec.reshape(-1, 1)
+
+    # Pairwise squared distances
+    d2 = (sub - sub.T) ** 2
+    # Drop zeros on the diagonal
+    d2 = d2[d2 > 0]
+
+    if d2.size == 0:
+        return 1.0
+
+    med = float(np.median(d2))
+    gamma = 1.0 / (med + 1e-12)
+    return gamma
+
+
 # -----------------------------
 # Smooth MMD -> weights mapping (log-median, spread-adaptive)
 # -----------------------------
@@ -331,4 +373,103 @@ def aggregate_states(states, weights):
         if not all(v.shape == shape0 for v in vs):
             continue
 
-    ...
+        # Only aggregate floating-point tensors; for others, just copy the first one
+        if all(torch.is_floating_point(v) for v in vs):
+            # Stack parameters for this key: shape [N, ...]
+            stacked = torch.stack(vs, dim=0)  # first dim = num_users
+            w = torch.tensor(weights, dtype=stacked.dtype, device=stacked.device)
+
+            # Build a broadcastable shape for w: [N, 1, 1, ..., 1]
+            view_shape = [len(weights)] + [1] * (stacked.dim() - 1)
+            w_view = w.view(*view_shape)
+
+            # Weighted sum along user dimension
+            weighted = (stacked * w_view).sum(dim=0)
+
+            out[k] = weighted.to(vs[0].dtype)
+        else:
+            out[k] = vs[0]
+
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--round", type=int, required=True, help="Round number")
+    ap.add_argument("--ref_edge", type=str, required=True, help="Reference edge npy file")
+    ap.add_argument("--user_models", type=str, nargs="+", required=True, help="User model checkpoints")
+    ap.add_argument("--user_edges", type=str, nargs="+", required=True, help="User edge npy files")
+    ap.add_argument("--out_model", type=str, required=True, help="Output aggregated model path")
+    ap.add_argument("--out_edge", type=str, required=True, help="Output aggregated edge npy path")
+    ap.add_argument("--out_metrics", type=str, required=True, help="Output metrics JSON path")
+    ap.add_argument("--gamma", type=float, default=0.0, help="RBF kernel gamma for MMD")
+    ap.add_argument("--block", type=int, default=65536, help="Block size for MMD computation")
+    ap.add_argument("--eps", type=float, default=1e-12, help="Epsilon for numerical stability")
+    ap.add_argument("--subsample", type=int, default=1, help="Subsampling step for edge vectors")
+    ap.add_argument("--alpha", type=float, default=3.0,
+                    help="Base penalty strength for MMD-based down-weighting.")
+    ap.add_argument("--power", type=float, default=2.0,
+                    help="Exponent in the decay exp(-alpha_eff * z^power).")
+
+    args = ap.parse_args()
+
+    user_vecs = [load_edge_vector(p) for p in args.user_edges]
+    ref_vec = load_edge_vector(args.ref_edge)
+
+    # Align vector lengths conservatively to the shortest among ref and users
+    min_len = min([ref_vec.size] + [v.size for v in user_vecs])
+    ref_vec = ref_vec[:min_len]
+    user_vecs = [v[:min_len] for v in user_vecs]
+
+    # Decide effective gamma: manual if >0, otherwise auto from data
+    if args.gamma <= 0:
+        gamma_eff = auto_gamma_from_vectors(ref_vec, user_vecs)
+        print(f"[Mode] Auto gamma: {gamma_eff:.6f}")
+    else:
+        gamma_eff = float(args.gamma)
+        print(f"[Mode] Manual gamma: {gamma_eff:.6f}")
+
+    mmds, weights = smooth_mmd_weights_log_median_adaptive(
+        user_edge_vecs=user_vecs,
+        ref_vec=ref_vec,
+        gamma=gamma_eff,
+        eps=args.eps,
+        block=args.block,
+        subsample=None if args.subsample <= 1 else args.subsample,
+        alpha=args.alpha,
+        power=args.power,
+    )
+
+    states = [load_model_state(p) for p in args.user_models]
+    agg_state = aggregate_states(states, weights)
+    save_model_state(agg_state, args.out_model)
+
+    # Weighted average of edges (using aligned 1D vectors)
+    weighted_edge = np.zeros(min_len, dtype=np.float64)
+    for v, w in zip(user_vecs, weights):
+        weighted_edge += float(w) * v
+
+    ensure_dir(Path(args.out_edge).parent)
+    np.save(args.out_edge, weighted_edge)
+
+    metrics = {
+        "round": args.round,
+        "ref_edge": args.ref_edge,
+        "user_models": args.user_models,
+        "user_edges": args.user_edges,
+        "gamma": gamma_eff,
+        "mmds": [float(x) for x in mmds],
+        "weights": [float(w) for w in weights],
+        "alpha": args.alpha,
+        "power": args.power,
+        "global_model": args.out_model,
+        "global_edge": args.out_edge,
+    }
+
+    ensure_dir(Path(args.out_metrics).parent)
+    with open(args.out_metrics, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()
